@@ -1,14 +1,11 @@
 const express = require("express");
 const axios = require("axios");
-const cron = require("node-cron");
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, InteractionType } = require("discord.js");
 require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-
-// Load environment variables
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
@@ -19,14 +16,25 @@ app.use((req, res, next) => {
   next();
 });
 
-// Helper to format stock items
+// Format stock items
 function formatItems(obj) {
   return Object.entries(obj || {})
     .map(([key, val]) => `• **${key}**: ${val}`)
     .join('\n');
 }
 
-// Send update to Discord via webhook
+// Countdown to next update
+function getNextUpdateCountdown() {
+  const now = new Date();
+  const minutes = now.getMinutes();
+  const seconds = now.getSeconds();
+  const remaining = ((5 - (minutes % 5)) * 60 - seconds);
+  const m = Math.floor(remaining / 60);
+  const s = remaining % 60;
+  return `${m}m ${s}s`;
+}
+
+// Send stock update to Discord
 async function sendToDiscord() {
   try {
     const ts = Date.now();
@@ -41,8 +49,11 @@ async function sendToDiscord() {
     const eggs = eggRes.data;
     const weather = weatherRes.data;
 
+    const manilaTime = new Date().toLocaleTimeString("en-PH", { timeZone: "Asia/Manila" });
+    const countdown = getNextUpdateCountdown();
+
     const message = `
-🌱 **Garden Stock Update**
+🌱 **Garden Stock Update** *(at ${manilaTime})*
 
 **🧰 Gear**
 ${formatItems(stock.gear)}
@@ -55,28 +66,49 @@ ${formatItems(eggs.egg)}
 
 **🌤️ Weather**: ${weather.weather || 'Unknown'}
 **🌡️ Temp**: ${weather.temp || 'N/A'}°C
+
+⏳ **Next update in**: ${countdown}
     `;
 
     await axios.post(DISCORD_WEBHOOK_URL, { content: message });
-    console.log("✅ Auto-update sent to Discord at", new Date().toLocaleTimeString());
+    console.log("✅ Sent to Discord at", manilaTime);
   } catch (err) {
     console.error("❌ Failed to send to Discord:", err.message);
   }
 }
 
-// Schedule auto-update every 5 minutes
-cron.schedule("*/5 * * * *", () => {
-  console.log("⏱️ Scheduled auto-update triggered...");
-  sendToDiscord();
-});
+// Schedule syncing at every 5-minute mark + 12 second delay
+function scheduleAtExactFiveMinuteMark() {
+  const now = new Date();
+  const delayUntilNext5 = (5 - (now.getMinutes() % 5)) * 60 * 1000 - now.getSeconds() * 1000 - now.getMilliseconds();
 
-// Manual trigger route
+  console.log(`🕓 Waiting ${Math.round(delayUntilNext5 / 1000)}s to align with next 5-min mark...`);
+
+  setTimeout(() => {
+    const buffer = 80000; 
+
+    // First delayed update
+    setTimeout(() => {
+      sendToDiscord();
+    }, buffer);
+
+    // Repeat every 5 minutes
+    setInterval(() => {
+      setTimeout(() => {
+        sendToDiscord();
+      }, buffer);
+    }, 5 * 60 * 1000);
+
+  }, delayUntilNext5);
+}
+
+// ====== EXPRESS ROUTES ======
+
 app.get("/api/send", async (req, res) => {
   await sendToDiscord();
   res.json({ success: true, message: "Sent to Discord!" });
 });
 
-// API for frontend use
 app.get("/api/stock", async (req, res) => {
   try {
     const ts = Date.now();
@@ -107,13 +139,17 @@ app.get("/api/weather", async (req, res) => {
   }
 });
 
-// Start Express server
 app.listen(PORT, () => {
   console.log(`🚀 Proxy server running at http://localhost:${PORT}`);
+
+  // Send initial update
+  sendToDiscord();
+
+  // Start scheduled syncing
+  scheduleAtExactFiveMinuteMark();
 });
 
-
-// ========== DISCORD BOT + SLASH COMMAND ==========
+// ====== DISCORD BOT SETUP ======
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
@@ -122,11 +158,9 @@ const client = new Client({
 client.once("ready", async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
 
-  // Register /stock command globally
   const rest = new REST({ version: "10" }).setToken(DISCORD_BOT_TOKEN);
 
   try {
-    console.log("📦 Registering slash command...");
     await rest.put(
       Routes.applicationGuildCommands(client.user.id, '1031935299783245964'),
       {
@@ -138,7 +172,7 @@ client.once("ready", async () => {
         ]
       }
     );
-    console.log("✅ Slash command /stock registered.");
+    console.log("✅ /stock command registered.");
   } catch (error) {
     console.error("❌ Failed to register slash command:", error);
   }
@@ -161,8 +195,11 @@ client.on("interactionCreate", async (interaction) => {
       const eggs = eggRes.data;
       const weather = weatherRes.data;
 
+      const countdown = getNextUpdateCountdown();
+      const manilaTime = new Date().toLocaleTimeString("en-PH", { timeZone: "Asia/Manila" });
+
       const msgContent = `
-🌱 **Garden Stock Update**
+🌱 **Garden Stock Update** *(at ${manilaTime})*
 
 **🧰 Gear**
 ${formatItems(stock.gear)}
@@ -175,13 +212,14 @@ ${formatItems(eggs.egg)}
 
 **🌤️ Weather**: ${weather.weather || 'Unknown'}
 **🌡️ Temp**: ${weather.temp || 'N/A'}°C
+
+⏳ **Next update in**: ${countdown}
       `;
 
       await interaction.editReply(msgContent);
       console.log("📤 Responded to /stock");
-      
     } catch (err) {
-      console.error("❌ Error during /stock:", err.message);
+      console.error("❌ Error in /stock:", err.message);
       await interaction.editReply("❌ Failed to fetch stock/weather data.");
     }
   }
