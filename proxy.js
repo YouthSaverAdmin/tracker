@@ -1,228 +1,162 @@
 const express = require("express");
 const axios = require("axios");
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, InteractionType } = require("discord.js");
-require("dotenv").config();
+const dotenv = require("dotenv");
+const _ = require("lodash");
+
+dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3001;
-
+const PORT = 3001;
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
-const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
-const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 
-// CORS middleware
+let lastData = null;
+
+// CORS for frontend dev
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "*");
   next();
 });
 
-// Format stock items
-function formatItems(obj) {
-  return Object.entries(obj || {})
-    .map(([key, val]) => `• **${key}**: ${val}`)
-    .join('\n');
+// Utility: clean and normalize data
+function cleanData(raw) {
+  const filter = obj => Object.entries(obj).filter(([_, v]) => v !== "0");
+
+  return {
+    playerName: "POOPY",
+    timestamp: raw.timestamp,
+    weather: filter(raw.weather),
+    seeds: filter(raw.seeds),
+    gear: filter(raw.gear),
+    honeyEvent: filter(raw.honeyevent),
+    cosmetics: filter(raw.cosmetic),
+    eggs: raw.eggs || []
+  };
 }
 
-// Countdown to next update
-function getNextUpdateCountdown() {
-  const now = new Date();
-  const minutes = now.getMinutes();
-  const seconds = now.getSeconds();
-  const remaining = ((5 - (minutes % 5)) * 60 - seconds);
-  const m = Math.floor(remaining / 60);
-  const s = remaining % 60;
-  return `${m}m ${s}s`;
+// Utility: build Discord message content
+function buildDiscordMessage(data, changeSummary = null) {
+  const format = list => list.map(([name, qty]) => `• ${name} × ${qty}`).join("\n") || "_None_";
+  const eggs = data.eggs.map(e => `• ${e.name} × ${e.quantity}`).join("\n") || "_None_";
+
+  let content = `
+🌿 **Garden Stock Update**
+👤 Player: ${data.playerName}
+🕒 ${new Date(data.timestamp * 1000).toLocaleString()}
+
+🌤️ Weather: ${data.weather?.type || "Unknown"}
+
+
+🌱 **Seeds**
+${format(data.seeds)}
+
+⚙️ **Gear**
+${format(data.gear)}
+
+🍯 **Honey Event**
+${format(data.honeyEvent)}
+
+🎨 **Cosmetics**
+${format(data.cosmetics)}
+
+🥚 **Eggs**
+${eggs}
+`.trim();
+
+  if (changeSummary) {
+    content += `
+
+🌟 **Change Summary**
+${changeSummary}
+`;
+  }
+
+  return content;
 }
 
-// Send stock update to Discord
-async function sendToDiscord() {
+// Utility: compare previous vs current and build summary
+function getChangeSummary(prev, curr) {
+  const compareList = (oldList, newList) => {
+    const diff = [];
+    const map = Object.fromEntries(oldList);
+    for (const [name, qty] of newList) {
+      const oldQty = parseInt(map[name] || "0");
+      const newQty = parseInt(qty);
+      const delta = newQty - oldQty;
+      if (delta !== 0) {
+        diff.push(`• ${name} ${delta > 0 ? "+" : ""}${delta}`);
+      }
+    }
+    return diff;
+  };
+
+  const eggChanges = [];
+  const eggMap = Object.fromEntries((prev.eggs || []).map(e => [e.name, e.quantity]));
+  for (const e of curr.eggs || []) {
+    const old = eggMap[e.name] || 0;
+    const diff = e.quantity - old;
+    if (diff !== 0) eggChanges.push(`• ${e.name} ${diff > 0 ? "+" : ""}${diff}`);
+  }
+
+  const combined = [
+    ...compareList(prev.seeds, curr.seeds),
+    ...compareList(prev.gear, curr.gear),
+    ...compareList(prev.honeyEvent, curr.honeyEvent),
+    ...compareList(prev.cosmetics, curr.cosmetics),
+    ...eggChanges
+  ];
+
+  return combined.length > 0 ? combined.join("\n") : null;
+}
+
+// Discord sender
+async function sendToDiscord(data, changeSummary = null) {
+  if (!DISCORD_WEBHOOK_URL) return;
+
   try {
-    const ts = Date.now();
-
-    const [stockRes, eggRes, weatherRes] = await Promise.all([
-      axios.get(`https://growagardenstock.com/api/stock?type=gear-seeds&ts=${ts}`),
-      axios.get(`https://growagardenstock.com/api/stock?type=egg&ts=${ts}`),
-      axios.get(`https://growagardenstock.com/api/stock/weather?ts=${ts}&_=${ts}`)
-    ]);
-
-    const stock = stockRes.data;
-    const eggs = eggRes.data;
-    const weather = weatherRes.data;
-
-    const manilaTime = new Date().toLocaleTimeString("en-PH", { timeZone: "Asia/Manila" });
-    const countdown = getNextUpdateCountdown();
-
-    const message = `
-🌱 **Garden Stock Update** *(at ${manilaTime})*
-
-**🧰 Gear**
-${formatItems(stock.gear)}
-
-**🌾 Seeds**
-${formatItems(stock.seeds)}
-
-**🥚 Eggs**
-${formatItems(eggs.egg)}
-
-**🌤️ Weather**: ${weather.weather || 'Unknown'}
-**🌡️ Temp**: ${weather.temp || 'N/A'}°C
-
-⏳ **Next update in**: ${countdown}
-    `;
-
-    await axios.post(DISCORD_WEBHOOK_URL, { content: message });
-    console.log("✅ Sent to Discord at", manilaTime);
+    await axios.post(DISCORD_WEBHOOK_URL, {
+      content: buildDiscordMessage(data, changeSummary),
+      username: "GardenBot",
+      avatar_url: "https://cdn-icons-png.flaticon.com/512/2909/2909766.png"
+    });
+    console.log("✅ Sent update to Discord.");
   } catch (err) {
-    console.error("❌ Failed to send to Discord:", err.message);
+    console.error("❌ Failed to send Discord message:", err.message);
   }
 }
 
-// Schedule syncing at every 5-minute mark + 12 second delay
-function scheduleAtExactFiveMinuteMark() {
-  const now = new Date();
-  const delayUntilNext5 = (5 - (now.getMinutes() % 5)) * 60 * 1000 - now.getSeconds() * 1000 - now.getMilliseconds();
-
-  console.log(`🕓 Waiting ${Math.round(delayUntilNext5 / 1000)}s to align with next 5-min mark...`);
-
-  setTimeout(() => {
-    const buffer = 80000; 
-
-    // First delayed update
-    setTimeout(() => {
-      sendToDiscord();
-    }, buffer);
-
-    // Repeat every 5 minutes
-    setInterval(() => {
-      setTimeout(() => {
-        sendToDiscord();
-      }, buffer);
-    }, 5 * 60 * 1000);
-
-  }, delayUntilNext5);
-}
-
-// ====== EXPRESS ROUTES ======
-
-app.get("/api/send", async (req, res) => {
-  await sendToDiscord();
-  res.json({ success: true, message: "Sent to Discord!" });
-});
-
+// Main route
 app.get("/api/stock", async (req, res) => {
   try {
-    const ts = Date.now();
-    const response = await axios.get(`https://growagardenstock.com/api/stock?type=gear-seeds&ts=${ts}`);
-    res.json(response.data);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to fetch stock data." });
-  }
-});
+    const response = await axios.get("https://www.gamersberg.com/api/grow-a-garden/stock");
+    const raw = response.data?.data?.[0];
+    if (!raw) throw new Error("Invalid response");
 
-app.get("/api/egg", async (req, res) => {
-  try {
-    const ts = Date.now();
-    const response = await axios.get(`https://growagardenstock.com/api/stock?type=egg&ts=${ts}`);
-    res.json(response.data);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to fetch egg data." });
-  }
-});
+    const currentData = cleanData(raw);
+    const comparable = _.omit(currentData, "timestamp");
+    const previousComparable = lastData ? _.omit(lastData, "timestamp") : null;
 
-app.get("/api/weather", async (req, res) => {
-  try {
-    const ts = Date.now();
-    const response = await axios.get(`https://growagardenstock.com/api/stock/weather?ts=${ts}&_=${ts}`);
-    res.json(response.data);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to fetch weather data." });
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`🚀 Proxy server running at http://localhost:${PORT}`);
-
-  // Send initial update
-  sendToDiscord();
-
-  // Start scheduled syncing
-  scheduleAtExactFiveMinuteMark();
-});
-
-// ====== DISCORD BOT SETUP ======
-
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
-});
-
-client.once("ready", async () => {
-  console.log(`🤖 Logged in as ${client.user.tag}`);
-
-  const rest = new REST({ version: "10" }).setToken(DISCORD_BOT_TOKEN);
-
-  try {
-    await rest.put(
-      Routes.applicationGuildCommands(client.user.id, '1031935299783245964'),
-      {
-        body: [
-          new SlashCommandBuilder()
-            .setName("stock")
-            .setDescription("Get the latest garden gear, seeds, eggs, and weather.")
-            .toJSON()
-        ]
-      }
-    );
-    console.log("✅ /stock command registered.");
-  } catch (error) {
-    console.error("❌ Failed to register slash command:", error);
-  }
-});
-
-client.on("interactionCreate", async (interaction) => {
-  if (interaction.type !== InteractionType.ApplicationCommand) return;
-  if (interaction.commandName === "stock") {
-    try {
-      await interaction.deferReply();
-
-      const ts = Date.now();
-      const [stockRes, eggRes, weatherRes] = await Promise.all([
-        axios.get(`https://growagardenstock.com/api/stock?type=gear-seeds&ts=${ts}`),
-        axios.get(`https://growagardenstock.com/api/stock?type=egg&ts=${ts}`),
-        axios.get(`https://growagardenstock.com/api/stock/weather?ts=${ts}&_=${ts}`)
-      ]);
-
-      const stock = stockRes.data;
-      const eggs = eggRes.data;
-      const weather = weatherRes.data;
-
-      const countdown = getNextUpdateCountdown();
-      const manilaTime = new Date().toLocaleTimeString("en-PH", { timeZone: "Asia/Manila" });
-
-      const msgContent = `
-🌱 **Garden Stock Update** *(at ${manilaTime})*
-
-**🧰 Gear**
-${formatItems(stock.gear)}
-
-**🌾 Seeds**
-${formatItems(stock.seeds)}
-
-**🥚 Eggs**
-${formatItems(eggs.egg)}
-
-**🌤️ Weather**: ${weather.weather || 'Unknown'}
-**🌡️ Temp**: ${weather.temp || 'N/A'}°C
-
-⏳ **Next update in**: ${countdown}
-      `;
-
-      await interaction.editReply(msgContent);
-      console.log("📤 Responded to /stock");
-    } catch (err) {
-      console.error("❌ Error in /stock:", err.message);
-      await interaction.editReply("❌ Failed to fetch stock/weather data.");
+    if (!_.isEqual(previousComparable, comparable)) {
+      const summary = lastData ? getChangeSummary(lastData, currentData) : null;
+      lastData = currentData;
+      await sendToDiscord(currentData, summary);
     }
+
+    res.json({ success: true, extracted: currentData });
+  } catch (err) {
+    console.error("❌ Error fetching data:", err.message);
+    res.status(500).json({ success: false, message: "Fetch failed", error: err.message });
   }
 });
 
-client.login(DISCORD_BOT_TOKEN);
+// Periodic check
+setInterval(() => {
+  axios.get(`http://localhost:${PORT}/api/stock`)
+    .then(() => console.log("🔄 Auto-check completed."))
+    .catch(err => console.error("❌ Auto-check failed:", err.message));
+}, 30000);
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`🚀 Proxy server running at http://localhost:${PORT}/api/stock`);
+});
